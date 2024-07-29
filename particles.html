@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="css/example.cs">
+    <title>Particles 2</title>
+    <link rel="icon" href="https://fav.farm/🔥" />
+    <style>
+        #stats{
+            background-color: rgb(0, 0, 0);
+        }
+        #device-info{
+            background-color: black;
+        }
+        * {
+            background-color: rgba(0, 0, 0, 0);
+            /* color: white; */
+        }
+        a {
+            background: linear-gradient(to right, violet, indigo, blue, green, yellow, orange, red);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+            text-decoration: none;
+
+        }
+        h1 {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            color: white;
+            font-size: 25px;
+            text-align: center;
+            
+        }
+        #webgpucanvas{
+            position: relative;
+            z-index: -1;
+        }
+    </style>
+</head>
+<!--
+  The MIT License (MIT)
+
+  Copyright (c) 2020 Tarek Sherif
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in
+  the Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+  the Software, and to permit persons to whom the Software is furnished to do so,
+  subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+  IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+-->
+<body>
+<h1>
+    (Nah 1:3) The LORD is slow to anger, and great in power, and will not at all acquit the wicked: the LORD hath his way in the whirlwind and in the storm, and the clouds are the dust of his feet.
+</h1>
+
+<canvas id="webgpu-canvas" style="background-color: black;"></canvas>
+<div id="stats" style="background-color: black;">
+    <div id="device-info" style="background-color: black;"></div>
+    <div style="background-color: black;">
+        CPU Frame Time: <span id="cpu-time" style="background-color: black;"></span>
+    </div>
+    <div style="background-color: black;">
+        GPU Compute Time: <span id="compute-time"></span>
+    </div>
+    <div style="background-color: black;">
+        GPU Draw Time: <span id="draw-time"></span>
+    </div>
+</div>
+<script type="module" style="background-color: black;">
+import { checkSupport, addDescription, parseAdapterInfo } from "./utils/utils.js";
+import { Timer } from "./utils/Timer.js";
+
+const WORKGROUP_SIZE = 64;
+const NUM_WORKGROUPS = 1000;
+const NUM_PARTICLES = WORKGROUP_SIZE * NUM_WORKGROUPS;
+const PARTICLE_SIZE = 2;
+
+checkSupport();
+addDescription(
+  "Particles",
+  `<div style="background-color: #000000; padding: 1px; border-radius: 5px;">${NUM_PARTICLES} instanced quad particles.</div>`,
+  "particles.html"
+);
+
+(async () => {
+    //////////////////////////////////////////
+    // Set up WebGPU adapter
+    //////////////////////////////////////////
+
+    const adapter = await navigator.gpu.requestAdapter();
+    const presentationFormat = navigator.gpu.getPreferredCanvasFormat(adapter);
+
+    ////////////////////////////////////
+    // Set up device and canvas context
+    ////////////////////////////////////
+
+    const [adapterInfo, device] = await Promise.all([
+        adapter.requestAdapterInfo(),
+        adapter.requestDevice({
+            requiredFeatures: adapter.features.has("timestamp-query") ? ["timestamp-query"] : []
+        })
+    ]);
+
+    const canvas = document.getElementById("webgpu-canvas");
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    const context = canvas.getContext("webgpu");
+    
+    context.configure({
+        device,
+        format: presentationFormat
+    });
+
+    document.getElementById("device-info").innerText = parseAdapterInfo(adapterInfo);
+
+    const timer = new Timer(device);
+
+    const cpuTimeDisplay = document.getElementById("cpu-time");
+    const computeTimeDisplay = document.getElementById("compute-time");
+    const drawTimeDisplay = document.getElementById("draw-time");
+
+    ////////////////////////////////////////////////////////
+    // Create buffers for compute pass
+    // (positionBuffer also used in render pass)
+    ////////////////////////////////////////////////////////
+
+    const positionBuffer = device.createBuffer({
+        size: 16 * NUM_PARTICLES,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+    const positionBufferData = new Float32Array(NUM_PARTICLES * 4);
+    for (let i = 0; i < positionBufferData.length; i += 4) {
+        positionBufferData[i]     = Math.random() * 2 - 1;
+        positionBufferData[i + 1] = Math.random() * 2 - 1;
+        positionBufferData[i + 2] = Math.random() * 2 - 1;
+        positionBufferData[i + 3] = 1;
+    }
+    device.queue.writeBuffer(positionBuffer, 0, positionBufferData);
+
+    const velocityBuffer = device.createBuffer({
+        size: 16 * NUM_PARTICLES,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+    });
+    const velocityBufferData = new Float32Array(NUM_PARTICLES * 4);
+    for (let i = 0; i < velocityBufferData.length; i += 4) {
+        velocityBufferData[i]     = Math.random() * 0.002 - 0.001;
+        velocityBufferData[i + 1] = Math.random() * 0.002 - 0.001;
+        velocityBufferData[i + 2] = Math.random() * 0.002 - 0.001;
+        velocityBufferData[i + 3] = 0;
+    }
+    device.queue.writeBuffer(velocityBuffer, 0, velocityBufferData);
+
+    ///////////////////////////////////
+    // Create compute shader module
+    //////////////////////////////////
+
+    const computeShaderModule = device.createShaderModule({
+        code: `
+            struct Mass {
+                position1: vec4f,
+                position2: vec4f,
+                position3: vec4f,
+                factor1: f32,
+                factor2: f32,
+                factor3: f32
+            };
+
+            @group(0) @binding(0) var<storage, read_write> positions: array<vec4f>;
+            @group(0) @binding(1) var<storage, read_write> velocities: array<vec4f>; 
+            @group(0) @binding(2) var<uniform> mass: Mass;
+
+            @compute @workgroup_size(${WORKGROUP_SIZE})
+            fn cs(@builtin(global_invocation_id) global_id: vec3u) {
+                let index = global_id.x;
+                let position = positions[index].xyz;
+                var velocity = velocities[index].xyz;
+
+                var massVec = mass.position1.xyz - position;
+                var massDist2 = max(0.01, dot(massVec, massVec));
+                var acceleration = mass.factor1 * normalize(massVec) / massDist2;
+                massVec = mass.position2.xyz - position;
+                massDist2 = max(0.01, dot(massVec, massVec));
+                acceleration += mass.factor2 * normalize(massVec) / massDist2;
+                massVec = mass.position3.xyz - position;
+                massDist2 = max(0.01, dot(massVec, massVec));
+                acceleration += mass.factor3 * normalize(massVec) / massDist2;
+
+                velocity += acceleration;
+                velocity *= 0.9999;
+
+                positions[index] = vec4f(position + velocity, 1);
+                velocities[index] = vec4f(velocity, 0);
+            }
+
+        `
+    })
+
+    const computePipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {
+            module: computeShaderModule,
+            entryPoint: "cs"
+        }
+    });
+
+    //////////////////////////
+    // Compute uniform buffer 
+    //////////////////////////
+
+    const computeUniformData = new Float32Array([
+        Math.random() * 2.0 - 1.0, Math.random() * 2.0 - 1.0, 0, 1.0,          // Mass 1 position
+        Math.random() * 2.0 - 1.0, Math.random() * 2.0 - 1.0, 0, 1.0,          // Mass 2 position
+        Math.random() * 2.0 - 1.0, Math.random() * 2.0 - 1.0, 0, 1.0,          // Mass 3 position
+        Math.random() / 30000, Math.random() / 30000, Math.random() / 30000, 0 // Mass factors
+    ]);
+
+    const computeUniformBuffer = device.createBuffer({
+        size: computeUniformData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    device.queue.writeBuffer(computeUniformBuffer, 0, computeUniformData);
+
+    ////////////////////////
+    // Compute bind group
+    ////////////////////////
+
+    const computeBindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+            {
+                binding: 0,
+                resource: {
+                    buffer: positionBuffer
+                }
+            },
+            {
+                binding: 1,
+                resource: {
+                    buffer: velocityBuffer
+                }
+            },
+            {
+                binding: 2,
+                resource: {
+                    buffer: computeUniformBuffer
+                }
+            }
+        ]
+    });
+
+    const computePassDescription = {
+        timestampWrites: timer.gpuPassDescriptor("compute")
+    };
+
+    ///////////////////////////////////
+    // Create buffers for render pass
+    ///////////////////////////////////
+
+    const vertexBuffer = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(vertexBuffer, 0, new Float32Array([
+        -1.0, -1.0,
+        1.0, -1.0,
+        -1.0, 1.0,
+        1.0, 1.0
+    ]));
+
+    const colorBuffer = device.createBuffer({
+        size: 4 * NUM_PARTICLES,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    const colorBufferData = new Uint8Array(4 * NUM_PARTICLES);
+    for (let i = 0; i < colorBufferData.length; i += 4) {
+        colorBufferData[i]     = Math.floor(Math.random() * 256);
+        colorBufferData[i + 1] = Math.floor(Math.random() * 256);
+        colorBufferData[i + 2] = Math.floor(Math.random() * 256);
+        colorBufferData[i + 3] = 128;
+    }
+    device.queue.writeBuffer(colorBuffer, 0, colorBufferData);
+
+    /////////////////////////////////
+    // Create render shader module
+    /////////////////////////////////
+
+    const renderShaderModule = device.createShaderModule({
+        code: `
+            struct VertexUniforms {
+                screenDimensions: vec2f,
+                particleSize: f32
+            };
+
+            struct VSOut {
+                @builtin(position) clipPosition: vec4f,
+                @location(0) color: vec4f
+            };
+
+            @group(0) @binding(0) var<uniform> vertexUniforms: VertexUniforms;
+
+            @vertex
+            fn vs(
+                @location(0) vertexPosition: vec2f,
+                @location(1) color: vec4f,
+                @location(2) position: vec3f
+            ) -> VSOut {
+                var vsOut: VSOut;
+                vsOut.clipPosition = vec4f(vertexPosition * vertexUniforms.particleSize / vertexUniforms.screenDimensions + position.xy, position.z, 1.0);
+                vsOut.color = color;
+
+                return vsOut;
+            }             
+
+            @fragment 
+            fn fs(@location(0) color: vec4f) -> @location(0) vec4f {
+                return vec4f(color.rgb * color.a, color.a);
+            } 
+        `
+    });
+
+     /////////////////////////////////
+    // Create render pipeline
+    /////////////////////////////////
+
+    const renderPipeline = device.createRenderPipeline({
+        layout: "auto",
+        vertex: {
+            module: renderShaderModule,
+            entryPoint: "vs",
+            buffers: [
+                {
+                    arrayStride: 8,
+                    attributes: [{
+                        shaderLocation: 0,
+                        format: "float32x2",
+                        offset: 0
+                    }]
+                },
+                {
+                    arrayStride: 4,
+                    stepMode: "instance",
+                    attributes: [{
+                        shaderLocation: 1,
+                        format: "unorm8x4",
+                        offset: 0
+                    }]
+                },
+                {
+                    arrayStride: 16,
+                    stepMode: "instance",
+                    attributes: [{
+                        shaderLocation: 2,
+                        format: "float32x4",
+                        offset: 0
+                    }]
+                }
+            ]
+        },
+        fragment: {
+            module: renderShaderModule,
+            entryPoint: "fs",
+            targets: [{
+                format: presentationFormat,
+                blend: {
+                    color: {
+                        srcFactor: "one",
+                        dstFactor: "one-minus-src-alpha"
+                    },
+                    alpha: {
+                        srcFactor: "one",
+                        dstFactor: "one-minus-src-alpha"
+                    }
+                }
+            }]
+        },
+        multisample: {
+            count: 4
+        },
+        primitive: {
+            topology: "triangle-strip",
+            stripIndexFormat: "uint32"
+        }
+    });
+
+    ///////////////////////////////////////////////
+    // Rendering uniform buffer
+    ///////////////////////////////////////////////
+
+    const vertexUniformBuffer = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    device.queue.writeBuffer(vertexUniformBuffer, 0, new Float32Array([
+        canvas.width, canvas.height, PARTICLE_SIZE
+    ]));
+
+    const vertexUniformBindGroup = device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [{
+            binding: 0,
+            resource: {
+                buffer: vertexUniformBuffer
+            }
+        }]
+    });
+
+
+    ///////////////////////////
+    // Render pass description
+    ///////////////////////////
+
+    let msaaTexture = device.createTexture({
+        label: 'msaa texture',
+        size: [canvas.width, canvas.height],
+        format: presentationFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount: 4
+    });
+
+    const renderPassDescription = {
+        colorAttachments: [{
+            view: msaaTexture.createView(),
+            resolveTarget: context.getCurrentTexture().createView(),
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: [0, 0, 0, 1]
+        }],
+        timestampWrites: timer.gpuPassDescriptor("draw")
+    };
+
+    window.addEventListener("resize", () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        msaaTexture.destroy();
+        msaaTexture = device.createTexture({
+            label: 'msaa texture',
+            size: [canvas.width, canvas.height],
+            format: presentationFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            sampleCount: 4
+        });
+
+        renderPassDescription.colorAttachments[0].view = msaaTexture.createView()
+    });
+
+    requestAnimationFrame(function draw() {
+        timer.cpuTimeStart("frame");
+
+        /////////////////////////
+        // Set up command buffer
+        /////////////////////////
+
+        const commandEncoder = device.createCommandEncoder();
+
+        ///////////////////////
+        // Encode compute pass
+        ///////////////////////
+
+        const computePass = commandEncoder.beginComputePass(computePassDescription);
+        computePass.setPipeline(computePipeline);
+        computePass.setBindGroup(0, computeBindGroup);
+        computePass.dispatchWorkgroups(NUM_WORKGROUPS);
+        computePass.end();
+
+        ////////////////////////////////
+        // Get current canvas texture
+        ////////////////////////////////
+
+        renderPassDescription.colorAttachments[0].resolveTarget = context.getCurrentTexture().createView();
+
+        ///////////////////////
+        // Encode render pass
+        ///////////////////////
+
+        const renderPass = commandEncoder.beginRenderPass(renderPassDescription);
+        renderPass.setPipeline(renderPipeline);
+
+        // First argument here refers to array index
+        // in renderPipeline vertexState.vertexBuffers
+        renderPass.setVertexBuffer(0, vertexBuffer);
+        renderPass.setVertexBuffer(1, colorBuffer);
+        renderPass.setVertexBuffer(2, positionBuffer);
+        renderPass.setBindGroup(0, vertexUniformBindGroup);
+        
+        renderPass.draw(4, NUM_PARTICLES);
+        renderPass.end();
+
+        //////////////////////////
+        // Submit command buffer
+        //////////////////////////
+
+        timer.gpuBeforeSubmit(commandEncoder);
+
+        device.queue.submit([commandEncoder.finish()]);
+
+        timer.gpuAfterSubmit();
+        timer.cpuTimeEnd("frame");
+
+        cpuTimeDisplay.innerText = `${timer.cpuTimes["frame"].toFixed(2)}ms`;
+        computeTimeDisplay.innerText = timer.hasGPUTimer ? `${timer.gpuTimes["compute"].toFixed(2)}ms` : "N/A";
+        drawTimeDisplay.innerText = timer.hasGPUTimer ? `${timer.gpuTimes["draw"].toFixed(2)}ms` : "N/A";
+
+        requestAnimationFrame(draw);
+    });
+})();
+</script>
+</body>
+</html>
